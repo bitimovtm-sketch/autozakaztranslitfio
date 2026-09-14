@@ -50,7 +50,7 @@ def bitrix_call(method, params):
     return response.json()
 
 
-@app.route("/translit-hook", methods=["POST"])
+@app.route("/translit-hook", methods=["GET", "POST"])
 def translit_hook():
     # deal_id может прийти либо в адресе (?deal_id=...) от робота БП,
     # либо в теле запроса (data[FIELDS][ID]) от глобального исходящего вебхука

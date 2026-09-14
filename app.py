@@ -44,19 +44,31 @@ def translit(text):
     return "".join(result)
 
 
-def bitrix_call(method, params):
-    """Делает запрос к Битрикс24 через входящий вебхук."""
+def bitrix_call(method, params, retries=3):
+    """Делает запрос к Битрикс24 через входящий вебхук.
+    При ошибке превышения лимита запросов (QUERY_LIMIT_EXCEEDED) ждёт и повторяет."""
     url = f"{BITRIX_WEBHOOK_URL}/{method}.json"
-    response = requests.post(url, json=params, timeout=15)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(retries):
+        response = requests.post(url, json=params, timeout=15)
+        data = response.json()
+        error = data.get("error")
+        if error == "QUERY_LIMIT_EXCEEDED" and attempt < retries - 1:
+            time.sleep(2)
+            continue
+        response.raise_for_status()
+        return data
+    return data
 
 
-# Настройки массовой обработки (можно переопределить в Railway -> Variables)
-BATCH_CATEGORY_ID = int(os.environ.get("BATCH_CATEGORY_ID", "10"))
-BATCH_MIN_DEAL_ID = int(os.environ.get("BATCH_MIN_DEAL_ID", "812484"))
+# Список ID сделок для массовой обработки — по одному ID на строку
+DEAL_IDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deal_ids.txt")
 
 batch_running = False  # чтобы не запустить обработку дважды одновременно
+
+
+def load_deal_ids():
+    with open(DEAL_IDS_FILE, "r") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
 def process_one_deal(deal_id):
@@ -98,41 +110,23 @@ def run_batch_job():
     processed = 0
     skipped = 0
     try:
-        start = 0
-        while True:
-            result = bitrix_call("crm.deal.list", {
-                "filter": {
-                    "CATEGORY_ID": BATCH_CATEGORY_ID,
-                    ">=ID": BATCH_MIN_DEAL_ID,
-                    ">CONTACT_ID": 0,
-                },
-                "select": ["ID", "CONTACT_ID"],
-                "order": {"ID": "ASC"},
-                "start": start,
-            })
-            deals = result.get("result", [])
-            if not deals:
-                break
+        deal_ids = load_deal_ids()
+        total = len(deal_ids)
+        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt ===")
 
-            for deal in deals:
-                deal_id = deal.get("ID")
-                try:
-                    ok, info = process_one_deal(deal_id)
-                    if ok:
-                        processed += 1
-                        print(f"Сделка {deal_id}: записано '{info}'")
-                    else:
-                        skipped += 1
-                        print(f"Сделка {deal_id}: пропущена ({info})")
-                except Exception as e:
+        for i, deal_id in enumerate(deal_ids, start=1):
+            try:
+                ok, info = process_one_deal(deal_id)
+                if ok:
+                    processed += 1
+                    print(f"[{i}/{total}] Сделка {deal_id}: записано '{info}'")
+                else:
                     skipped += 1
-                    print(f"Сделка {deal_id}: ошибка {e}")
-                time.sleep(0.3)  # пауза, чтобы не превысить лимит запросов Битрикса
-
-            next_start = result.get("next")
-            if next_start is None:
-                break
-            start = next_start
+                    print(f"[{i}/{total}] Сделка {deal_id}: пропущена ({info})")
+            except Exception as e:
+                skipped += 1
+                print(f"[{i}/{total}] Сделка {deal_id}: ошибка {e}")
+            time.sleep(0.3)  # пауза, чтобы не превысить лимит запросов Битрикса
 
         print(f"=== Массовая обработка завершена. Обработано: {processed}, пропущено: {skipped} ===")
     finally:
@@ -144,10 +138,14 @@ def run_batch():
     global batch_running
     if batch_running:
         return "Обработка уже выполняется, дождитесь завершения", 200
+    try:
+        total = len(load_deal_ids())
+    except FileNotFoundError:
+        return "Файл deal_ids.txt не найден рядом с app.py", 200
     thread = threading.Thread(target=run_batch_job, daemon=True)
     thread.start()
     return (
-        f"Массовая обработка запущена (воронка {BATCH_CATEGORY_ID}, сделки с ID >= {BATCH_MIN_DEAL_ID}). "
+        f"Массовая обработка запущена ({total} сделок из deal_ids.txt). "
         "Прогресс смотрите в Railway -> Deploy Logs.",
         200,
     )

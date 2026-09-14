@@ -55,7 +55,7 @@ def to_title_case(text):
 
 # Ограничитель скорости: не даём отправлять запросы к Битриксу чаще,
 # чем раз в MIN_INTERVAL секунд, независимо от того, сколько потоков работает одновременно
-MIN_INTERVAL = float(os.environ.get("BITRIX_MIN_INTERVAL", "0.5"))  # 0.5 сек = не больше 2 запросов в секунду
+MIN_INTERVAL = float(os.environ.get("BITRIX_MIN_INTERVAL", "1.2"))  # не больше ~50 запросов в минуту
 _rate_lock = threading.Lock()
 _last_call_ts = [0.0]
 
@@ -79,7 +79,7 @@ def bitrix_call(method, params, retries=5):
 
         if response.status_code == 429:
             if attempt < retries - 1:
-                retry_after = float(response.headers.get("Retry-After", 2))
+                retry_after = float(response.headers.get("Retry-After", 5 * (attempt + 1)))
                 time.sleep(retry_after)
                 continue
             response.raise_for_status()
@@ -141,7 +141,7 @@ def process_one_deal(deal_id):
 
 
 # Сколько сделок обрабатывать одновременно (скорость всё равно ограничена MIN_INTERVAL)
-BATCH_WORKERS = int(os.environ.get("BATCH_WORKERS", "2"))
+BATCH_WORKERS = int(os.environ.get("BATCH_WORKERS", "1"))
 
 
 def run_batch_job():

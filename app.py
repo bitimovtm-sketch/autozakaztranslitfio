@@ -53,17 +53,43 @@ def to_title_case(text):
     return " ".join(fixed_words)
 
 
-def bitrix_call(method, params, retries=3):
+# Ограничитель скорости: не даём отправлять запросы к Битриксу чаще,
+# чем раз в MIN_INTERVAL секунд, независимо от того, сколько потоков работает одновременно
+MIN_INTERVAL = float(os.environ.get("BITRIX_MIN_INTERVAL", "0.5"))  # 0.5 сек = не больше 2 запросов в секунду
+_rate_lock = threading.Lock()
+_last_call_ts = [0.0]
+
+
+def _wait_for_rate_limit():
+    with _rate_lock:
+        now = time.monotonic()
+        wait = MIN_INTERVAL - (now - _last_call_ts[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_ts[0] = time.monotonic()
+
+
+def bitrix_call(method, params, retries=5):
     """Делает запрос к Битрикс24 через входящий вебхук.
-    При ошибке превышения лимита запросов (QUERY_LIMIT_EXCEEDED) ждёт и повторяет."""
+    Сам ограничивает скорость запросов и повторяет при ошибке 429 / QUERY_LIMIT_EXCEEDED."""
     url = f"{BITRIX_WEBHOOK_URL}/{method}.json"
     for attempt in range(retries):
+        _wait_for_rate_limit()
         response = requests.post(url, json=params, timeout=15)
+
+        if response.status_code == 429:
+            if attempt < retries - 1:
+                retry_after = float(response.headers.get("Retry-After", 2))
+                time.sleep(retry_after)
+                continue
+            response.raise_for_status()
+
         data = response.json()
         error = data.get("error")
         if error == "QUERY_LIMIT_EXCEEDED" and attempt < retries - 1:
             time.sleep(2)
             continue
+
         response.raise_for_status()
         return data
     return data
@@ -114,8 +140,8 @@ def process_one_deal(deal_id):
     return True, full_name_en
 
 
-# Сколько сделок обрабатывать одновременно
-BATCH_WORKERS = int(os.environ.get("BATCH_WORKERS", "4"))
+# Сколько сделок обрабатывать одновременно (скорость всё равно ограничена MIN_INTERVAL)
+BATCH_WORKERS = int(os.environ.get("BATCH_WORKERS", "2"))
 
 
 def run_batch_job():

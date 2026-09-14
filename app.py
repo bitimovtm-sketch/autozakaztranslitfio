@@ -141,15 +141,12 @@ def load_deal_ids():
         return [line.strip() for line in f if line.strip()]
 
 
-def process_one_deal(deal_id, skip_if_filled=False):
+def process_one_deal(deal_id):
     """Обрабатывает одну сделку: находит контакт, транслитерирует ФИО, записывает в поле."""
     deal_result = bitrix_call("crm.deal.get", {"id": deal_id})
     deal = deal_result.get("result")
     if not deal:
         return False, "сделка не найдена"
-
-    if skip_if_filled and deal.get(f"UF_CRM_{TARGET_FIELD_CODE}"):
-        return None, "уже заполнено, пропуск"
 
     contact_id = deal.get("CONTACT_ID")
     if not contact_id:
@@ -185,43 +182,38 @@ def run_batch_job():
     global batch_running
     batch_running = True
     processed = 0
-    already = 0
     skipped = 0
     lock = threading.Lock()
     try:
         deal_ids = load_deal_ids()
         total = len(deal_ids)
-        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt (по {BATCH_WORKERS} одновременно, уже заполненные пропускаем) ===")
+        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt (по {BATCH_WORKERS} одновременно) ===")
 
         def handle(deal_id):
-            nonlocal processed, already, skipped
+            nonlocal processed, skipped
             if stop_requested:
                 with lock:
                     skipped += 1
-                    done = processed + already + skipped
+                    done = processed + skipped
                 print(f"[{done}/{total}] Сделка {deal_id}: пропущена (остановлено пользователем)")
                 return
             try:
-                ok, info = process_one_deal(deal_id, skip_if_filled=True)
+                ok, info = process_one_deal(deal_id)
             except Exception as e:
                 ok, info = False, f"ошибка {e}"
             with lock:
-                if ok is True:
+                if ok:
                     processed += 1
-                    status = "записано"
-                elif ok is None:
-                    already += 1
-                    status = "уже готово"
                 else:
                     skipped += 1
-                    status = "пропущена"
-                done = processed + already + skipped
+                done = processed + skipped
+            status = "записано" if ok else "пропущена"
             print(f"[{done}/{total}] Сделка {deal_id}: {status} '{info}'")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
             list(executor.map(handle, deal_ids))
 
-        print(f"=== Массовая обработка завершена. Записано: {processed}, уже было готово: {already}, пропущено с ошибкой: {skipped} ===")
+        print(f"=== Массовая обработка завершена. Записано: {processed}, пропущено: {skipped} ===")
     finally:
         batch_running = False
 

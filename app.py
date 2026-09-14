@@ -55,9 +55,16 @@ def to_title_case(text):
 
 # Ограничитель скорости: не даём отправлять запросы к Битриксу чаще,
 # чем раз в MIN_INTERVAL секунд, независимо от того, сколько потоков работает одновременно
-MIN_INTERVAL = float(os.environ.get("BITRIX_MIN_INTERVAL", "1.2"))  # не больше ~50 запросов в минуту
+MIN_INTERVAL = float(os.environ.get("BITRIX_MIN_INTERVAL", "2.0"))  # не больше 30 запросов в минуту
 _rate_lock = threading.Lock()
 _last_call_ts = [0.0]
+
+# "Предохранитель": если подряд идёт много перегрузок — останавливаем ВСЮ очередь
+# на долгую паузу, а не долбим короткими повторами (это только продлевает блокировку)
+_overload_lock = threading.Lock()
+_consecutive_overloads = [0]
+COOLDOWN_SECONDS = float(os.environ.get("BITRIX_COOLDOWN_SECONDS", "60"))
+OVERLOAD_THRESHOLD = int(os.environ.get("BITRIX_OVERLOAD_THRESHOLD", "3"))
 
 
 def _wait_for_rate_limit():
@@ -69,30 +76,57 @@ def _wait_for_rate_limit():
         _last_call_ts[0] = time.monotonic()
 
 
+def _register_overload():
+    """Считает перегрузки подряд. Если их слишком много — делает большую общую паузу."""
+    with _overload_lock:
+        _consecutive_overloads[0] += 1
+        count = _consecutive_overloads[0]
+    if count >= OVERLOAD_THRESHOLD:
+        print(f"=== Похоже, Битрикс перегружен ({count} ошибок подряд). Пауза {COOLDOWN_SECONDS} сек ===")
+        time.sleep(COOLDOWN_SECONDS)
+        with _overload_lock:
+            _consecutive_overloads[0] = 0
+
+
+def _register_success():
+    with _overload_lock:
+        _consecutive_overloads[0] = 0
+
+
 def bitrix_call(method, params, retries=5):
     """Делает запрос к Битрикс24 через входящий вебхук.
-    Сам ограничивает скорость запросов и повторяет при ошибке 429 / QUERY_LIMIT_EXCEEDED."""
+    Сам ограничивает скорость запросов и повторяет при перегрузке/зависании."""
     url = f"{BITRIX_WEBHOOK_URL}/{method}.json"
+    last_exception = None
     for attempt in range(retries):
         _wait_for_rate_limit()
-        response = requests.post(url, json=params, timeout=15)
+        try:
+            response = requests.post(url, json=params, timeout=30)
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            _register_overload()
+            if attempt < retries - 1:
+                continue
+            raise
 
         if response.status_code == 429:
+            _register_overload()
             if attempt < retries - 1:
-                retry_after = float(response.headers.get("Retry-After", 5 * (attempt + 1)))
-                time.sleep(retry_after)
                 continue
             response.raise_for_status()
 
         data = response.json()
         error = data.get("error")
-        if error == "QUERY_LIMIT_EXCEEDED" and attempt < retries - 1:
-            time.sleep(2)
-            continue
+        if error == "QUERY_LIMIT_EXCEEDED":
+            _register_overload()
+            if attempt < retries - 1:
+                continue
+            response.raise_for_status()
 
+        _register_success()
         response.raise_for_status()
         return data
-    return data
+    raise last_exception
 
 
 # Список ID сделок для массовой обработки — по одному ID на строку
@@ -107,12 +141,15 @@ def load_deal_ids():
         return [line.strip() for line in f if line.strip()]
 
 
-def process_one_deal(deal_id):
+def process_one_deal(deal_id, skip_if_filled=False):
     """Обрабатывает одну сделку: находит контакт, транслитерирует ФИО, записывает в поле."""
     deal_result = bitrix_call("crm.deal.get", {"id": deal_id})
     deal = deal_result.get("result")
     if not deal:
         return False, "сделка не найдена"
+
+    if skip_if_filled and deal.get(f"UF_CRM_{TARGET_FIELD_CODE}"):
+        return None, "уже заполнено, пропуск"
 
     contact_id = deal.get("CONTACT_ID")
     if not contact_id:
@@ -148,38 +185,43 @@ def run_batch_job():
     global batch_running
     batch_running = True
     processed = 0
+    already = 0
     skipped = 0
     lock = threading.Lock()
     try:
         deal_ids = load_deal_ids()
         total = len(deal_ids)
-        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt (по {BATCH_WORKERS} одновременно) ===")
+        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt (по {BATCH_WORKERS} одновременно, уже заполненные пропускаем) ===")
 
         def handle(deal_id):
-            nonlocal processed, skipped
+            nonlocal processed, already, skipped
             if stop_requested:
                 with lock:
                     skipped += 1
-                    done = processed + skipped
+                    done = processed + already + skipped
                 print(f"[{done}/{total}] Сделка {deal_id}: пропущена (остановлено пользователем)")
                 return
             try:
-                ok, info = process_one_deal(deal_id)
+                ok, info = process_one_deal(deal_id, skip_if_filled=True)
             except Exception as e:
                 ok, info = False, f"ошибка {e}"
             with lock:
-                if ok:
+                if ok is True:
                     processed += 1
+                    status = "записано"
+                elif ok is None:
+                    already += 1
+                    status = "уже готово"
                 else:
                     skipped += 1
-                done = processed + skipped
-            status = "записано" if ok else "пропущена"
+                    status = "пропущена"
+                done = processed + already + skipped
             print(f"[{done}/{total}] Сделка {deal_id}: {status} '{info}'")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
             list(executor.map(handle, deal_ids))
 
-        print(f"=== Массовая обработка завершена. Обработано: {processed}, пропущено: {skipped} ===")
+        print(f"=== Массовая обработка завершена. Записано: {processed}, уже было готово: {already}, пропущено с ошибкой: {skipped} ===")
     finally:
         batch_running = False
 

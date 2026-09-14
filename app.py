@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 import requests
 from flask import Flask, request
 
@@ -50,6 +52,107 @@ def bitrix_call(method, params):
     return response.json()
 
 
+# Настройки массовой обработки (можно переопределить в Railway -> Variables)
+BATCH_CATEGORY_ID = int(os.environ.get("BATCH_CATEGORY_ID", "10"))
+BATCH_MIN_DEAL_ID = int(os.environ.get("BATCH_MIN_DEAL_ID", "812484"))
+
+batch_running = False  # чтобы не запустить обработку дважды одновременно
+
+
+def process_one_deal(deal_id):
+    """Обрабатывает одну сделку: находит контакт, транслитерирует ФИО, записывает в поле."""
+    deal_result = bitrix_call("crm.deal.get", {"id": deal_id})
+    deal = deal_result.get("result")
+    if not deal:
+        return False, "сделка не найдена"
+
+    contact_id = deal.get("CONTACT_ID")
+    if not contact_id:
+        return False, "нет привязанного контакта"
+
+    contact_result = bitrix_call("crm.contact.get", {"id": contact_id})
+    contact = contact_result.get("result")
+    if not contact:
+        return False, "контакт не найден"
+
+    last_name = contact.get("LAST_NAME") or ""
+    name = contact.get("NAME") or ""
+    second_name = contact.get("SECOND_NAME") or ""
+
+    full_name_ru = " ".join(part for part in [last_name, name, second_name] if part)
+    full_name_en = translit(full_name_ru)
+
+    bitrix_call("crm.item.update", {
+        "entityTypeId": 2,
+        "id": deal_id,
+        "fields": {
+            f"ufCrm_{TARGET_FIELD_CODE}": full_name_en
+        }
+    })
+    return True, full_name_en
+
+
+def run_batch_job():
+    global batch_running
+    batch_running = True
+    processed = 0
+    skipped = 0
+    try:
+        start = 0
+        while True:
+            result = bitrix_call("crm.deal.list", {
+                "filter": {
+                    "CATEGORY_ID": BATCH_CATEGORY_ID,
+                    ">=ID": BATCH_MIN_DEAL_ID,
+                    ">CONTACT_ID": 0,
+                },
+                "select": ["ID", "CONTACT_ID"],
+                "order": {"ID": "ASC"},
+                "start": start,
+            })
+            deals = result.get("result", [])
+            if not deals:
+                break
+
+            for deal in deals:
+                deal_id = deal.get("ID")
+                try:
+                    ok, info = process_one_deal(deal_id)
+                    if ok:
+                        processed += 1
+                        print(f"Сделка {deal_id}: записано '{info}'")
+                    else:
+                        skipped += 1
+                        print(f"Сделка {deal_id}: пропущена ({info})")
+                except Exception as e:
+                    skipped += 1
+                    print(f"Сделка {deal_id}: ошибка {e}")
+                time.sleep(0.3)  # пауза, чтобы не превысить лимит запросов Битрикса
+
+            next_start = result.get("next")
+            if next_start is None:
+                break
+            start = next_start
+
+        print(f"=== Массовая обработка завершена. Обработано: {processed}, пропущено: {skipped} ===")
+    finally:
+        batch_running = False
+
+
+@app.route("/run-batch", methods=["GET"])
+def run_batch():
+    global batch_running
+    if batch_running:
+        return "Обработка уже выполняется, дождитесь завершения", 200
+    thread = threading.Thread(target=run_batch_job, daemon=True)
+    thread.start()
+    return (
+        f"Массовая обработка запущена (воронка {BATCH_CATEGORY_ID}, сделки с ID >= {BATCH_MIN_DEAL_ID}). "
+        "Прогресс смотрите в Railway -> Deploy Logs.",
+        200,
+    )
+
+
 @app.route("/translit-hook", methods=["GET", "POST"])
 def translit_hook():
     # Логируем всё, что пришло, чтобы можно было посмотреть в Railway Logs
@@ -69,39 +172,12 @@ def translit_hook():
     if not deal_id:
         return "no deal id", 200
 
-    # Получаем сделку: нужен CONTACT_ID и текущее значение целевого поля
-    deal_result = bitrix_call("crm.deal.get", {"id": deal_id})
-    deal = deal_result.get("result")
-    if not deal:
-        return "deal not found", 200
+    try:
+        ok, info = process_one_deal(deal_id)
+    except Exception as e:
+        return f"error: {e}", 200
 
-    contact_id = deal.get("CONTACT_ID")
-    if not contact_id:
-        return "no contact linked", 200
-
-    # Получаем ФИО контакта
-    contact_result = bitrix_call("crm.contact.get", {"id": contact_id})
-    contact = contact_result.get("result")
-    if not contact:
-        return "contact not found", 200
-
-    last_name = contact.get("LAST_NAME") or ""
-    name = contact.get("NAME") or ""
-    second_name = contact.get("SECOND_NAME") or ""
-
-    full_name_ru = " ".join(part for part in [last_name, name, second_name] if part)
-    full_name_en = translit(full_name_ru)
-
-    # Записываем результат в сделку через crm.item.update (entityTypeId=2 -> Сделка)
-    bitrix_call("crm.item.update", {
-        "entityTypeId": 2,
-        "id": deal_id,
-        "fields": {
-            f"ufCrm_{TARGET_FIELD_CODE}": full_name_en
-        }
-    })
-
-    return "ok", 200
+    return ("ok: " + info) if ok else info, 200
 
 
 @app.route("/", methods=["GET"])

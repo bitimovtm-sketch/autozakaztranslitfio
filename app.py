@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import concurrent.futures
 import requests
 from flask import Flask, request
 
@@ -34,14 +35,22 @@ def translit(text):
     for char in text:
         lower_char = char.lower()
         if lower_char in TRANSLIT_TABLE:
-            translit_char = TRANSLIT_TABLE[lower_char]
-            # Сохраняем заглавную букву, если исходная буква была заглавной
-            if char.isupper() and translit_char:
-                translit_char = translit_char[0].upper() + translit_char[1:]
-            result.append(translit_char)
+            result.append(TRANSLIT_TABLE[lower_char])
         else:
             result.append(char)
     return "".join(result)
+
+
+def to_title_case(text):
+    """Приводит к виду 'Имя Фамилия' независимо от регистра исходных данных
+    (в Битриксе встречаются контакты, записанные ЗАГЛАВНЫМИ буквами)."""
+    words = text.split(" ")
+    fixed_words = []
+    for word in words:
+        parts = word.split("-")
+        parts = [(p[:1].upper() + p[1:].lower()) if p else p for p in parts]
+        fixed_words.append("-".join(parts))
+    return " ".join(fixed_words)
 
 
 def bitrix_call(method, params, retries=3):
@@ -64,6 +73,7 @@ def bitrix_call(method, params, retries=3):
 DEAL_IDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deal_ids.txt")
 
 batch_running = False  # чтобы не запустить обработку дважды одновременно
+stop_requested = False  # флаг для остановки текущего прогона по требованию
 
 
 def load_deal_ids():
@@ -92,7 +102,7 @@ def process_one_deal(deal_id):
     second_name = contact.get("SECOND_NAME") or ""
 
     full_name_ru = " ".join(part for part in [last_name, name, second_name] if part)
-    full_name_en = translit(full_name_ru)
+    full_name_en = to_title_case(translit(full_name_ru))
 
     bitrix_call("crm.item.update", {
         "entityTypeId": 2,
@@ -104,29 +114,44 @@ def process_one_deal(deal_id):
     return True, full_name_en
 
 
+# Сколько сделок обрабатывать одновременно
+BATCH_WORKERS = int(os.environ.get("BATCH_WORKERS", "4"))
+
+
 def run_batch_job():
     global batch_running
     batch_running = True
     processed = 0
     skipped = 0
+    lock = threading.Lock()
     try:
         deal_ids = load_deal_ids()
         total = len(deal_ids)
-        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt ===")
+        print(f"=== Начинаю обработку {total} сделок из deal_ids.txt (по {BATCH_WORKERS} одновременно) ===")
 
-        for i, deal_id in enumerate(deal_ids, start=1):
+        def handle(deal_id):
+            nonlocal processed, skipped
+            if stop_requested:
+                with lock:
+                    skipped += 1
+                    done = processed + skipped
+                print(f"[{done}/{total}] Сделка {deal_id}: пропущена (остановлено пользователем)")
+                return
             try:
                 ok, info = process_one_deal(deal_id)
+            except Exception as e:
+                ok, info = False, f"ошибка {e}"
+            with lock:
                 if ok:
                     processed += 1
-                    print(f"[{i}/{total}] Сделка {deal_id}: записано '{info}'")
                 else:
                     skipped += 1
-                    print(f"[{i}/{total}] Сделка {deal_id}: пропущена ({info})")
-            except Exception as e:
-                skipped += 1
-                print(f"[{i}/{total}] Сделка {deal_id}: ошибка {e}")
-            time.sleep(0.3)  # пауза, чтобы не превысить лимит запросов Битрикса
+                done = processed + skipped
+            status = "записано" if ok else "пропущена"
+            print(f"[{done}/{total}] Сделка {deal_id}: {status} '{info}'")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
+            list(executor.map(handle, deal_ids))
 
         print(f"=== Массовая обработка завершена. Обработано: {processed}, пропущено: {skipped} ===")
     finally:
@@ -135,20 +160,30 @@ def run_batch_job():
 
 @app.route("/run-batch", methods=["GET"])
 def run_batch():
-    global batch_running
+    global batch_running, stop_requested
     if batch_running:
         return "Обработка уже выполняется, дождитесь завершения", 200
     try:
         total = len(load_deal_ids())
     except FileNotFoundError:
         return "Файл deal_ids.txt не найден рядом с app.py", 200
+    stop_requested = False
     thread = threading.Thread(target=run_batch_job, daemon=True)
     thread.start()
     return (
-        f"Массовая обработка запущена ({total} сделок из deal_ids.txt). "
+        f"Массовая обработка запущена ({total} сделок из deal_ids.txt, по {BATCH_WORKERS} одновременно). "
         "Прогресс смотрите в Railway -> Deploy Logs.",
         200,
     )
+
+
+@app.route("/stop-batch", methods=["GET"])
+def stop_batch():
+    global stop_requested
+    if not batch_running:
+        return "Сейчас ничего не выполняется", 200
+    stop_requested = True
+    return "Останавливаю после текущих сделок в работе...", 200
 
 
 @app.route("/translit-hook", methods=["GET", "POST"])

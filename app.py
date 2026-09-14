@@ -52,8 +52,12 @@ def bitrix_call(method, params):
 
 @app.route("/translit-hook", methods=["POST"])
 def translit_hook():
-    data = request.form.to_dict()
-    deal_id = data.get("data[FIELDS][ID]")
+    # deal_id может прийти либо в адресе (?deal_id=...) от робота БП,
+    # либо в теле запроса (data[FIELDS][ID]) от глобального исходящего вебхука
+    deal_id = request.args.get("deal_id")
+    if not deal_id:
+        data = request.form.to_dict()
+        deal_id = data.get("data[FIELDS][ID]")
 
     if not deal_id:
         return "no deal id", 200

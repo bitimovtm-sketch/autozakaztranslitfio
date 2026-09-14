@@ -52,6 +52,13 @@ def bitrix_call(method, params):
 
 @app.route("/translit-hook", methods=["GET", "POST"])
 def translit_hook():
+    # Логируем всё, что пришло, чтобы можно было посмотреть в Railway Logs
+    print("=== Новый запрос ===")
+    print("Метод:", request.method)
+    print("Параметры адреса (args):", dict(request.args))
+    print("Тело запроса (form):", dict(request.form))
+    print("=====================")
+
     # deal_id может прийти либо в адресе (?deal_id=...) от робота БП,
     # либо в теле запроса (data[FIELDS][ID]) от глобального исходящего вебхука
     deal_id = request.args.get("deal_id")

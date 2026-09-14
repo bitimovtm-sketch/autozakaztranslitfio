@@ -68,11 +68,6 @@ def translit_hook():
     if not deal:
         return "deal not found", 200
 
-    # Защита от зацикливания: если поле уже заполнено — ничего не делаем
-    current_value = deal.get(f"UF_CRM_{TARGET_FIELD_CODE}")
-    if current_value:
-        return "already filled", 200
-
     contact_id = deal.get("CONTACT_ID")
     if not contact_id:
         return "no contact linked", 200
